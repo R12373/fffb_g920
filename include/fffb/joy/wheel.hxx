@@ -38,16 +38,17 @@ public:
         constexpr bool disable_autocenter () const noexcept ;
         constexpr bool  enable_autocenter () const noexcept ;
 
-        constexpr bool download_forces () const noexcept ;
+        bool download_forces () noexcept ;
         constexpr bool  refresh_forces ()       noexcept ;
 
-        constexpr bool play_forces () noexcept ;
-        constexpr bool stop_forces () noexcept ;
+        bool play_forces () noexcept ;
+        bool stop_forces () noexcept ;
 
         constexpr bool set_led_pattern ( uti::u8_t _pattern_ ) const noexcept ;
 
         constexpr void q_disable_autocenter () noexcept ;
         constexpr void  q_enable_autocenter () noexcept ;
+        void q_set_autocenter(uti::u16_t magnitude) noexcept;
 
         constexpr void q_download_forces () noexcept ;
         constexpr void  q_refresh_forces () noexcept ;
@@ -88,7 +89,7 @@ private:
         constexpr bool _write_report (          report   const & report , char const * scope ) const noexcept ;
         constexpr bool _write_reports ( vector< report > const & reports, char const * scope ) const noexcept ;
 
-        constexpr bool _init_protocol () const noexcept ;
+        bool _init_protocol () noexcept ;
 } ;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -98,41 +99,47 @@ constexpr wheel::wheel () noexcept
 {
         vector< hid_device > devices = list_hid_devices() ;
 
-        for( auto & device : devices )
+        for (auto & device : devices)
         {
-                if( device.usage     () != FFFB_WHEEL_USAGE ||
-                    device.usage_page() != FFFB_WHEEL_USAGE_PAGE )
+                if (device.vendor_id() != Logitech_VendorID)
+                        continue;
+
+                if( device.usage_page() != 0x01 ) continue;
+                if( device.usage() != 0x04 ) continue;  // <- critical: only joystick interface
+                if( device.product_id() != 0xC261 && device.product_id() != 0xC262 ) continue;
+
+
+                // TEMP: don’t skip by usage for Logitech while we locate HID++ interface
+                // (keep logging usage_page/usage)
+
+                uti::u8_t maj=0, min=0, idx=0;
+
+                device.open();
+                bool ok = protocol::hidpp_ping(device, maj, min, idx);
+                device.close();
+
+                FFFB_F_INFO_S("probe",
+                        "dev=%08x vid=%04x pid=%04x usage_page=%x usage=%x hidpp_ping=%d ver=%u.%u idx=%02x",
+                        device.device_id(), device.vendor_id(), device.product_id(),
+                        device.usage_page(), device.usage(),
+                        ok ? 1 : 0, (unsigned)maj, (unsigned)min, (unsigned)idx);
+
+                if (ok)
                 {
-                        FFFB_F_DBG_S( "wheel::ctor", "skipping device 0x%.8x due to bad usage" ) ;
-                        continue ;
+                        device_ = UTI_MOVE(device);
+                        protocol_ = ffb_protocol::logitech_hidpp;
+                        break;
                 }
-                for( auto const & known_wheel : known_wheel_device_ids )
-                {
-                        if( device.device_id () == known_wheel
-                         && device.usage_page() == FFFB_WHEEL_USAGE_PAGE
-                         && device.usage     () == FFFB_WHEEL_USAGE )
-                        {
-                                FFFB_F_INFO_S( "wheel::ctor", "using wheel with device id 0x%.8x", device.device_id() ) ;
-                                device_ = UTI_MOVE( device ) ;
-                                protocol_ = get_supported_protocol( device_ ) ;
-                        }
                 }
-                if( device.vendor_id() == Logitech_VendorID )
+                if( device_ )
                 {
-                        FFFB_F_WARN_S( "wheel::ctor", "using unknown logitech wheel with device id 0x%.8x", device.device_id() ) ;
-                        device_ = UTI_MOVE( device ) ;
-                        protocol_ = get_supported_protocol( device_ ) ;
+                        _init_protocol() ;
+                }
+                else
+                {
+                        FFFB_F_ERR_S( "wheel::ctor", "no known wheels found!" ) ;
                 }
         }
-        if( device_ )
-        {
-                _init_protocol() ;
-        }
-        else
-        {
-                FFFB_F_ERR_S( "wheel::ctor", "no known wheels found!" ) ;
-        }
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -207,13 +214,31 @@ constexpr bool wheel::calibrate () noexcept
 ////////////////////////////////////////////////////////////////////////////////
 
 constexpr bool wheel::disable_autocenter () const noexcept
-{
-        return _write_report( protocol::disable_autocenter( protocol_, 0x0F ), "wheel::disable_autocenter" ) ;
+{       auto rep = protocol::disable_autocenter(protocol_, 0x0F);
+        if (rep.len == 0) return true;   // treat “not implemented” as no-op
+        return _write_report( rep, "wheel::disable_autocenter" ) ;
 }
 
-constexpr bool wheel::enable_autocenter () const noexcept
+inline void wheel::q_set_autocenter(uti::u16_t magnitude) noexcept
 {
-        return _write_report( protocol::enable_autocenter( protocol_, 0x0F ), "wheel::enable_autocenter" ) ;
+    if (protocol_ == ffb_protocol::logitech_hidpp)
+    {
+        reports_.emplace_back(protocol::hidpp_ff_set_autocenter(magnitude));
+        return;
+    }
+
+    // Classic fallback: keep existing behavior
+    if (magnitude == 0)
+        q_disable_autocenter();
+    else
+        q_enable_autocenter();
+}
+
+
+constexpr bool wheel::enable_autocenter () const noexcept
+{       auto rep = protocol::enable_autocenter(protocol_, 0x0F);
+        if (rep.len == 0) return true;   // treat “not implemented” as no-op
+        return _write_report(rep, "wheel::enable_autocenter" ) ;
 }
 
 constexpr void wheel::q_disable_autocenter () noexcept
@@ -228,37 +253,91 @@ constexpr void wheel::q_enable_autocenter () noexcept
 
 ////////////////////////////////////////////////////////////////////////////////
 
-constexpr bool wheel::download_forces () const noexcept
+// constexpr bool wheel::download_forces () const noexcept
+// {
+//         force f_const  { force_type::CONSTANT , {} } ;
+//         force f_spring { force_type::SPRING   , {} } ;
+//         force f_damper { force_type::DAMPER   , {} } ;
+//         force f_trap   { force_type::TRAPEZOID, {} } ;
+
+//         f_const .constant  = constant_   ;
+//         f_spring.spring    = spring_     ;
+//         f_damper.damper    = damper_     ;
+//         f_trap  .trapezoid = trapezoid_  ;
+
+//         vector< report > reports( 5 ) ;
+
+//         if( f_const.params.enabled )
+//         {
+//                 reports.emplace_back( protocol::download_force( protocol_, f_const ) ) ;
+//         }
+//         if( f_spring.params.enabled )
+//         {
+//                 reports.emplace_back( protocol::download_force( protocol_, f_spring ) ) ;
+//         }
+//         if( f_damper.params.enabled )
+//         {
+//                 reports.emplace_back( protocol::download_force( protocol_, f_damper ) ) ;
+//         }
+//         if( f_trap.params.enabled )
+//         {
+//                 reports.emplace_back( protocol::download_force( protocol_, f_trap ) ) ;
+//         }
+//         return _write_reports( reports, "wheel::download_forces" ) ;
+// }
+
+inline bool wheel::download_forces() noexcept
 {
-        force f_const  { force_type::CONSTANT , {} } ;
-        force f_spring { force_type::SPRING   , {} } ;
-        force f_damper { force_type::DAMPER   , {} } ;
-        force f_trap   { force_type::TRAPEZOID, {} } ;
+    force f_const  { force_type::CONSTANT , {} };
+    force f_spring { force_type::SPRING   , {} };
+    force f_damper { force_type::DAMPER   , {} };
+    force f_trap   { force_type::TRAPEZOID, {} };
 
-        f_const .constant  = constant_   ;
-        f_spring.spring    = spring_     ;
-        f_damper.damper    = damper_     ;
-        f_trap  .trapezoid = trapezoid_  ;
+    f_const .constant  = constant_;
+    f_spring.spring    = spring_;
+    f_damper.damper    = damper_;
+    f_trap  .trapezoid = trapezoid_;
 
-        vector< report > reports( 5 ) ;
+    // --- HID++ path: do “send + read reply” per effect (no report batching) ---
+    if (protocol_ == ffb_protocol::logitech_hidpp)
+    {
+        if (!device_.open())
+            return false;
 
-        if( f_const.params.enabled )
+        if (!device_.enable_input_reports())
         {
-                reports.emplace_back( protocol::download_force( protocol_, f_const ) ) ;
+            device_.close();
+            return false;
         }
-        if( f_spring.params.enabled )
-        {
-                reports.emplace_back( protocol::download_force( protocol_, f_spring ) ) ;
-        }
-        if( f_damper.params.enabled )
-        {
-                reports.emplace_back( protocol::download_force( protocol_, f_damper ) ) ;
-        }
-        if( f_trap.params.enabled )
-        {
-                reports.emplace_back( protocol::download_force( protocol_, f_trap ) ) ;
-        }
-        return _write_reports( reports, "wheel::download_forces" ) ;
+
+        bool ok = true;
+
+        if (f_const.params.enabled)
+            ok = ok && protocol::hidpp_download_force_sync(device_, f_const);
+
+        if (f_spring.params.enabled)
+            ok = ok && protocol::hidpp_download_force_sync(device_, f_spring);
+
+        if (f_damper.params.enabled)
+            ok = ok && protocol::hidpp_download_force_sync(device_, f_damper);
+
+        if (f_trap.params.enabled)
+            ok = ok && protocol::hidpp_download_force_sync(device_, f_trap);
+
+        device_.close();
+        return ok;
+    }
+
+    // --- Classic path: batch output reports like before ---
+    vector<report> reports;
+    reports.reserve(4);  // IMPORTANT: don't pre-fill with empty reports
+
+    if (f_const.params.enabled)  reports.emplace_back(protocol::download_force(protocol_, f_const));
+    if (f_spring.params.enabled) reports.emplace_back(protocol::download_force(protocol_, f_spring));
+    if (f_damper.params.enabled) reports.emplace_back(protocol::download_force(protocol_, f_damper));
+    if (f_trap.params.enabled)   reports.emplace_back(protocol::download_force(protocol_, f_trap));
+
+    return _write_reports(reports, "wheel::download_forces");
 }
 
 constexpr void wheel::q_download_forces () noexcept
@@ -293,7 +372,7 @@ constexpr void wheel::q_download_forces () noexcept
 
 ////////////////////////////////////////////////////////////////////////////////
 
-constexpr bool wheel::play_forces () noexcept
+inline bool wheel::play_forces () noexcept
 {
         playing_ = true ;
 
@@ -303,8 +382,9 @@ constexpr bool wheel::play_forces () noexcept
         if( spring_   .enabled ) slots |= spring_   .slot ;
         if( damper_   .enabled ) slots |= damper_   .slot ;
         if( trapezoid_.enabled ) slots |= trapezoid_.slot ;
-
-        return _write_report( protocol::play_force( protocol_, slots ), "wheel::play_forces" ) ;
+        auto rep = protocol::play_force(protocol_, slots);
+        if (rep.len == 0) return true;   // treat “not implemented” as no-op
+        return _write_report(rep,  "wheel::play_forces" ) ;
 }
 
 constexpr void wheel::q_play_forces () noexcept
@@ -323,11 +403,81 @@ constexpr void wheel::q_play_forces () noexcept
 
 ////////////////////////////////////////////////////////////////////////////////
 
-constexpr bool wheel::stop_forces () noexcept
-{
-        playing_ = false ;
+// constexpr bool wheel::stop_forces () noexcept
+// {
+//         playing_ = false ;
+//         auto rep = protocol::play_force(protocol_, 0x0F);
+//         if (rep.len == 0) return true;   // treat “not implemented” as no-op
+//         return _write_report(rep, "wheel::stop_forces" ) ;
+//             playing_ = false;
 
-        return _write_report( protocol::stop_force( protocol_, 0x0F ), "wheel::stop_forces" ) ;
+//         if (protocol_ == ffb_protocol::logitech_hidpp)
+//         {
+//                 // Kill any AUTOSTART effects (constant from calibrate, etc.)
+//                 return _write_report(protocol::hidpp_ff_reset_all(), "wheel::hidpp_ff_reset_all(stop_forces)");
+//         }
+
+//         auto rep = protocol::play_force(protocol_, 0x0F);
+//         if (rep.len == 0) return true;
+//         return _write_report(rep, "wheel::stop_forces");
+// }
+
+// constexpr bool wheel::stop_forces () noexcept
+// {
+//     playing_ = false;
+
+//     if (protocol_ == ffb_protocol::logitech_hidpp)
+//     {
+//         if (!device_.open()) return false;
+//         device_.enable_input_reports();
+
+//         auto & ctx = hidpp_ctx();
+//         // Stop all tracked slots (constant/spring/damper/trap/autocenter if present)
+//         for (int i = 0; i < 16; ++i)
+//         {
+//             uti::u8_t slot = ctx.ff_slot_by_force_mask[i];
+//             if (slot) protocol::hidpp_set_effect_state_sync(device_, slot, protocol::HIDPP_FF_EFFECT_STATE_STOP);
+//         }
+
+//         device_.close();
+//         return true;
+//     }
+
+//     // classic path (leave as-is or switch to stop_force() if you want)
+//     auto rep = protocol::play_force(protocol_, 0x0F);
+//     if (rep.len == 0) return true;
+//     return _write_report(rep, "wheel::stop_forces");
+// }
+
+inline bool wheel::stop_forces() noexcept
+{
+    playing_ = false;
+
+    // For HID++: RESET_ALL clears everything, including your baseline spring.
+    // Re-apply baseline autocenter immediately so the wheel doesn't go back to "default stiff".
+    if (protocol_ == ffb_protocol::logitech_hidpp)
+    {
+        bool ok = true;
+
+        // stop everything
+        ok = ok && _write_report(protocol::hidpp_ff_reset_all(), "wheel::hidpp_ff_reset_all(stop)");
+
+        // choose one of these:
+        ok = ok && _write_report(
+            protocol::hidpp_ff_set_autocenter(protocol::HIDPP_FF_BASELINE_AUTOCENTER),
+            "wheel::hidpp_ff_set_autocenter(BASELINE-after-stop)"
+        );
+
+        // If you want it totally limp after stop instead, use:
+        // ok = ok && _write_report(protocol::hidpp_ff_set_autocenter(0), "autocenter_off_after_stop");
+
+        return ok;
+    }
+
+    // Classic path unchanged
+    auto rep = protocol::stop_force(protocol_, 0x0F);
+    if (rep.len == 0) return true;
+    return _write_report(rep, "wheel::stop_forces");
 }
 
 constexpr void wheel::q_stop_forces () noexcept
@@ -410,7 +560,9 @@ constexpr void wheel::q_refresh_forces () noexcept
 
 constexpr bool wheel::set_led_pattern ( uti::u8_t pattern ) const noexcept
 {
-        return _write_report( protocol::set_led_pattern( protocol_, pattern ), "wheel::set_led_pattern" ) ;
+        auto rep = protocol::set_led_pattern(protocol_, pattern);
+        if (rep.len == 0) return true;   // treat “not implemented” as no-op
+        return _write_report( rep, "wheel::set_led_pattern" ) ;
 }
 
 constexpr void wheel::q_set_led_pattern ( uti::u8_t pattern ) noexcept
@@ -477,16 +629,62 @@ constexpr bool wheel::_write_reports ( vector< report > const & reports, [[ mayb
 
 ////////////////////////////////////////////////////////////////////////////////
 
-constexpr bool wheel::_init_protocol () const noexcept
+
+bool wheel::_init_protocol() noexcept
 {
-        auto init_sequence = protocol::init_sequence( protocol_, device_.device_id() ) ;
+    if( protocol_ == ffb_protocol::logitech_hidpp )
+    {
+        uti::u8_t maj=0, min=0, idx=0;
 
-        if( init_sequence.empty() ) return true ;
+        if( !device_.open() )
+        {
+            FFFB_F_ERR_S("wheel::init_protocol", "failed opening device %x", device_.device_id());
+            return false;
+        }
 
-        return _write_reports( init_sequence, "wheel::init_sequence" ) ;
+        if (!device_.enable_input_reports()) {
+        FFFB_F_ERR_S("wheel::init_protocol", "enable_input_reports failed");
+        device_.close();
+        return false;
+        }
+
+        bool ok_ping = protocol::hidpp_ping(device_, maj, min, idx);
+        if( !ok_ping )
+        {
+            FFFB_F_ERR_S("wheel::init_protocol", "HID++ ping FAILED");
+            device_.close();
+            return false;
+        }
+
+        FFFB_F_INFO_S("wheel::init_protocol",
+                      "HID++ ping OK: version %u.%u (dev_index=0x%02x)",
+                      (unsigned)maj, (unsigned)min, (unsigned)idx);
+
+        if( !protocol::hidpp_init(device_, idx) )
+        {
+            FFFB_F_ERR_S("wheel::init_protocol", "HID++ init FAILED (no FF feature)");
+            device_.close();
+            return false;
+        }
+        hidpp_ctx().dev_index = idx;
+
+        // device_ is already open here:
+        if (!device_.write(protocol::hidpp_ff_reset_all()))
+        FFFB_F_ERR_S("wheel::init_protocol", "hidpp_ff_reset_all write failed");
+
+        if (!device_.write(protocol::hidpp_ff_set_autocenter(protocol::HIDPP_FF_BASELINE_AUTOCENTER)))
+        FFFB_F_ERR_S("wheel::init_protocol", "hidpp_ff_set_autocenter write failed");
+
+        device_.close();
+        return true;
+    }
+
+    auto init_sequence = protocol::init_sequence(protocol_, device_.device_id());
+    if( init_sequence.empty() ) return true;
+    return _write_reports(init_sequence, "wheel::init_sequence");
 }
 
-////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////
 
 
 } // namespace fffb

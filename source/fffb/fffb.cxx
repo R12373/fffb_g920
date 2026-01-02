@@ -28,6 +28,7 @@
 #include <fffb/force/simulator.hxx>
 
 
+
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -104,6 +105,7 @@ bool reset_wheel () noexcept
         return g_simulator.wheel_ref() ? g_simulator.wheel_ref().q_disable_autocenter()
                                        , g_simulator.wheel_ref().q_stop_forces()
                                        , g_simulator.wheel_ref().q_set_led_pattern( 0 )
+                                       //, g_simulator.wheel_ref().q_set_autocenter(fffb::protocol::HIDPP_FF_BASELINE_AUTOCENTER) // TEMPORARY INCLUDE PROTOCOL HERE
                                        , g_simulator.wheel_ref().flush_reports()
                                        : true ;
 }
